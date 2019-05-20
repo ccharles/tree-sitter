@@ -34,6 +34,7 @@ pub(crate) struct ParseTableEntry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParseState {
+    pub id: usize,
     pub terminal_entries: HashMap<Symbol, ParseTableEntry>,
     pub nonterminal_entries: HashMap<Symbol, ParseStateId>,
     pub lex_state_id: usize,

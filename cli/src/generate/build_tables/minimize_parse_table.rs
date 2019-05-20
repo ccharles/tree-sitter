@@ -5,7 +5,7 @@ use crate::generate::rules::{AliasMap, Symbol};
 use crate::generate::tables::{ParseAction, ParseState, ParseTable, ParseTableEntry};
 use hashbrown::{HashMap, HashSet};
 use log::info;
-use std::mem;
+use std::{fmt, mem};
 
 pub(crate) fn minimize_parse_table(
     parse_table: &mut ParseTable,
@@ -24,6 +24,7 @@ pub(crate) fn minimize_parse_table(
         simple_aliases,
     };
     minimizer.remove_unit_reductions();
+    minimizer.remove_unused_states();
     minimizer.merge_compatible_states();
     minimizer.remove_unused_states();
     minimizer.reorder_states_by_descending_size();
@@ -157,16 +158,49 @@ impl<'a> Minimizer<'a> {
         let left_state = &self.parse_table.states[left];
         let right_state = &self.parse_table.states[right];
 
+        let left_id = left_state.id;
+        let right_id = right_state.id;
+
         if left_state.nonterminal_entries != right_state.nonterminal_entries {
+            info!(
+                "cannot merge {} {} because of differing non-terminals",
+                left_id, right_id,
+            );
             return false;
         }
 
         for (symbol, left_entry) in &left_state.terminal_entries {
             if let Some(right_entry) = right_state.terminal_entries.get(symbol) {
                 if right_entry.actions != left_entry.actions {
+                    info!(
+                        "cannot merge {} {} because of different actions for terminal {:?}: {:?}, {:?}",
+                        left_id,
+                        right_id,
+                        if symbol.is_external() {
+                            &self.syntax_grammar.external_tokens[symbol.index].name
+                        } else {
+                            &self.lexical_grammar.variables[symbol.index].name
+                        },
+                        ActionsDisplay(
+                            &left_entry.actions,
+                            &self.parse_table,
+                            &self.syntax_grammar
+                        ),
+                        ActionsDisplay(
+                            &right_entry.actions,
+                            &self.parse_table,
+                            &self.syntax_grammar
+                        ),
+                    );
                     return false;
                 }
-            } else if !self.can_add_entry_to_state(right_state, *symbol, left_entry) {
+            } else if !self.can_add_entry_to_state(
+                left_id,
+                right_id,
+                right_state,
+                *symbol,
+                left_entry,
+            ) {
                 return false;
             }
         }
@@ -174,7 +208,8 @@ impl<'a> Minimizer<'a> {
         let mut symbols_to_add = Vec::new();
         for (symbol, right_entry) in &right_state.terminal_entries {
             if !left_state.terminal_entries.contains_key(&symbol) {
-                if !self.can_add_entry_to_state(left_state, *symbol, right_entry) {
+                if !self.can_add_entry_to_state(left_id, right_id, left_state, *symbol, right_entry)
+                {
                     return false;
                 }
                 symbols_to_add.push(*symbol);
@@ -188,11 +223,14 @@ impl<'a> Minimizer<'a> {
                 .insert(symbol, entry);
         }
 
+        info!("merged {} {}", left_id, right_id);
         true
     }
 
     fn can_add_entry_to_state(
         &self,
+        left_id: usize,
+        right_id: usize,
         state: &ParseState,
         token: Symbol,
         entry: &ParseTableEntry,
@@ -200,18 +238,40 @@ impl<'a> Minimizer<'a> {
         // Do not add external tokens; they could conflict lexically with any of the state's
         // existing lookahead tokens.
         if token.is_external() {
+            let symbol_name = &self.syntax_grammar.external_tokens[token.index].name;
+            info!(
+                "cannot merge {} {} because of external token {}",
+                left_id, right_id, symbol_name
+            );
             return false;
         }
+
+        let symbol_name = &self.lexical_grammar.variables[token.index].name;
 
         // Only merge_compatible_states parse states by allowing existing reductions to happen
         // with additional lookahead tokens. Do not alter parse states in ways
         // that allow entirely new types of actions to happen.
-        if state.terminal_entries.iter().all(|(_, e)| e != entry) {
+        if state
+            .terminal_entries
+            .iter()
+            .all(|(_, e)| e.actions != entry.actions)
+        {
+            info!(
+                "cannot merge {} {} because of new actions for {}",
+                left_id, right_id, symbol_name
+            );
             return false;
         }
+
         match entry.actions.last() {
             Some(ParseAction::Reduce { .. }) => {}
-            _ => return false,
+            _ => {
+                info!(
+                    "cannot merge {} {} because of shift action token for {}",
+                    left_id, right_id, symbol_name,
+                );
+                return false;
+            }
         }
 
         // Do not add tokens which are both internal and external. Their validity could
@@ -222,6 +282,10 @@ impl<'a> Minimizer<'a> {
             .iter()
             .any(|t| t.corresponding_internal_token == Some(token))
         {
+            info!(
+                "cannot merge {} {} because of external token {}",
+                left_id, right_id, symbol_name
+            );
             return false;
         }
 
@@ -245,8 +309,10 @@ impl<'a> Minimizer<'a> {
                         .does_match_same_string(token.index, existing_token.index)
                 {
                     info!(
-                        "can't merge parse states because of conflict between {} and {}",
-                        self.lexical_grammar.variables[token.index].name,
+                        "cannot merge {} {} because of lexical conflict between {} and {}",
+                        left_id,
+                        right_id,
+                        symbol_name,
                         self.lexical_grammar.variables[existing_token.index].name
                     );
                     return false;
@@ -322,5 +388,31 @@ impl<'a> Minimizer<'a> {
                 state
             })
             .collect();
+    }
+}
+
+struct ActionsDisplay<'a>(&'a Vec<ParseAction>, &'a ParseTable, &'a SyntaxGrammar);
+
+impl<'a> fmt::Debug for ActionsDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "[")?;
+        for (i, action) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            match action {
+                ParseAction::Shift { state, .. } => {
+                    write!(f, "Shift({})", self.1.states[*state].id)?;
+                }
+                ParseAction::Reduce { symbol, .. } => {
+                    write!(f, "Reduce({})", self.2.variables[symbol.index].name)?;
+                }
+                _ => {
+                    write!(f, "{:?}", action)?;
+                }
+            }
+        }
+        write!(f, "]")?;
+        Ok(())
     }
 }
